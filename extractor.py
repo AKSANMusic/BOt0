@@ -54,8 +54,8 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
 def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace):
     if args.start > args.end:
         parser.error("--start must be <= --end")
-    if not args.contract.startswith("0x") or len(args.contract) != 42:
-        raise ValueError("--contract must start with '0x' and be 42 characters long.")
+    if not args.contract.startswith("0x") or len(args.contract) != 42 or not all(c in '0123456789abcdefABCDEF' for c in args.contract[2:]):
+        raise ValueError("--contract must start with '0x' and be a 42-character valid hex address.")
     if not Path(args.keywords_file).is_file():
         raise FileNotFoundError(f"--keywords-file '{args.keywords_file}' does not exist.")
 
@@ -102,7 +102,6 @@ async def write_batch(db: aiosqlite.Connection, batch: list[dict]) -> int:
         return 0
 
     try:
-        await db.execute("BEGIN TRANSACTION")
         for item in batch:
             await db.execute(
                 "INSERT OR IGNORE INTO tokens (token_id, name, description, image_url, raw_json) VALUES (?, ?, ?, ?, ?)",
@@ -124,7 +123,6 @@ async def write_batch(db: aiosqlite.Connection, batch: list[dict]) -> int:
 # Section 5: Alchemy API Client
 async def fetch_nft_metadata(
     session: aiohttp.ClientSession,
-    semaphore: asyncio.Semaphore,
     api_url: str,
     contract: str,
     token_id: int,
@@ -136,32 +134,38 @@ async def fetch_nft_metadata(
         if shutdown_event.is_set():
             return None
 
+        delay = BASE_BACKOFF
         try:
-            async with semaphore:
-                async with session.get(url) as response:
-                    if response.status == 200:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    try:
+                        data = await response.json()
                         stats["fetched"] += 1
-                        return await response.json()
-                    elif response.status == 429:
-                        stats["retries"] += 1
-                        retry_after = response.headers.get("Retry-After")
-                        if retry_after:
-                            try:
-                                delay = int(retry_after)
-                            except ValueError:
-                                delay = min(BASE_BACKOFF * (2 ** attempt) + random.uniform(0, 1), MAX_BACKOFF)
-                        else:
-                            delay = min(BASE_BACKOFF * (2 ** attempt) + random.uniform(0, 1), MAX_BACKOFF)
-                    elif response.status in {500, 502, 503, 504}:
-                        stats["retries"] += 1
-                        delay = min(BASE_BACKOFF * (2 ** attempt) + random.uniform(0, 1), MAX_BACKOFF)
-                    elif response.status in {400, 404}:
-                        log.warning(f"Token {token_id} permanently failed with status {response.status}")
+                        return data
+                    except (json.JSONDecodeError, aiohttp.ContentTypeError) as e:
+                        log.warning(f"Token {token_id}: 200 OK but malformed JSON: {e}")
                         stats["errors"] += 1
                         return None
+                elif response.status == 429:
+                    stats["retries"] += 1
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            delay = int(retry_after)
+                        except ValueError:
+                            delay = min(BASE_BACKOFF * (2 ** attempt) + random.uniform(0, 1), MAX_BACKOFF)
                     else:
-                        stats["retries"] += 1
                         delay = min(BASE_BACKOFF * (2 ** attempt) + random.uniform(0, 1), MAX_BACKOFF)
+                elif response.status in {500, 502, 503, 504}:
+                    stats["retries"] += 1
+                    delay = min(BASE_BACKOFF * (2 ** attempt) + random.uniform(0, 1), MAX_BACKOFF)
+                elif response.status in {400, 404}:
+                    log.warning(f"Token {token_id} permanently failed with status {response.status}")
+                    stats["errors"] += 1
+                    return None
+                else:
+                    stats["retries"] += 1
+                    delay = min(BASE_BACKOFF * (2 ** attempt) + random.uniform(0, 1), MAX_BACKOFF)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             stats["retries"] += 1
             delay = min(BASE_BACKOFF * (2 ** attempt) + random.uniform(0, 1), MAX_BACKOFF)
@@ -180,6 +184,10 @@ async def fetch_nft_metadata(
 def parse_nft_response(response: dict, token_id: int) -> dict | None:
     name = response.get("name") or ""
     description = response.get("description")
+
+    if not description:
+        description = (response.get("metadata") or {}).get("description")
+
     if not description:
         raw = response.get("raw") or {}
         metadata = raw.get("metadata") or {}
@@ -223,7 +231,6 @@ def extract_tags(description: str, pattern: re.Pattern) -> list[str]:
 # Section 7: Producer-Consumer Orchestrator
 async def producer(
     session: aiohttp.ClientSession,
-    semaphore: asyncio.Semaphore,
     queue: asyncio.Queue,
     api_url: str,
     contract: str,
@@ -235,14 +242,21 @@ async def producer(
     total = len(token_ids)
     stats["processed"] = 0
 
-    token_id_iter = iter(token_ids)
+    work_queue = asyncio.Queue()
+    for tid in token_ids:
+        work_queue.put_nowait(tid)
 
     async def worker():
-        for token_id in token_id_iter:
+        while not work_queue.empty():
             if shutdown_event.is_set():
                 break
 
-            response = await fetch_nft_metadata(session, semaphore, api_url, contract, token_id, stats)
+            try:
+                token_id = work_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            response = await fetch_nft_metadata(session, api_url, contract, token_id, stats)
             if response:
                 parsed = parse_nft_response(response, token_id)
                 if parsed:
@@ -256,6 +270,8 @@ async def producer(
             if processed % 100 == 0:
                 log.info(f"Progress: {processed}/{total} ({(processed/total)*100:.1f}%) | "
                          f"Errors: {stats['errors']} | Retries: {stats['retries']}")
+
+            work_queue.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
     if workers:
@@ -314,14 +330,13 @@ async def run(args: argparse.Namespace):
     else:
         api_url = f"https://{args.network}.g.alchemy.com/nft/v3/{args.api_key}/getNFTMetadata"
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-        semaphore = asyncio.Semaphore(args.concurrency)
         queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
 
-        stats = {"fetched": 0, "skipped": 0, "errors": 0, "retries": 0}
+        stats = {"fetched": 0, "skipped": 0, "errors": 0, "retries": 0, "processed": 0}
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
             producer_task = asyncio.create_task(
-                producer(session, semaphore, queue, api_url, args.contract, remaining_ids, keyword_pattern, stats, args.concurrency)
+                producer(session, queue, api_url, args.contract, remaining_ids, keyword_pattern, stats, args.concurrency)
             )
             consumer_task = asyncio.create_task(
                 consumer(db, queue, stats)
@@ -383,8 +398,6 @@ def main():
         log.setLevel(logging.DEBUG)
 
     try:
-        if sys.platform == 'win32':
-             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(run(args))
     except KeyboardInterrupt:
         log.info("Interrupted by user.")
