@@ -76,7 +76,9 @@ async def discover_contracts(
 
                             if (not to_addr or to_addr == "") and contract_addr:
                                 # Ensure standard format
-                                contract_addr = "0x" + contract_addr.lstrip("0x")
+                                if contract_addr.startswith("0x") or contract_addr.startswith("0X"):
+                                    contract_addr = contract_addr[2:]
+                                contract_addr = "0x" + contract_addr
 
                                 cursor = await db.execute(
                                     "SELECT status FROM contracts WHERE address = ?", (contract_addr,)
@@ -149,10 +151,16 @@ async def process_contracts(
 
                 stdout, stderr = await process.communicate()
 
-                if process.returncode == 0:
+                if process.returncode == 0 and not shutdown_event.is_set():
                     log.info(f"Extraction pipeline completed successfully for {contract_addr}")
                     await db.execute(
                         "UPDATE contracts SET status = 'completed', updated_at = datetime('now') WHERE address = ?",
+                        (contract_addr,)
+                    )
+                elif process.returncode == 0 and shutdown_event.is_set():
+                    log.warning(f"Extraction pipeline interrupted gracefully for {contract_addr}. Resetting status to pending for future resume.")
+                    await db.execute(
+                        "UPDATE contracts SET status = 'pending', updated_at = datetime('now') WHERE address = ?",
                         (contract_addr,)
                     )
                 else:
