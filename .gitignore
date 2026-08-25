@@ -10,3 +10,4 @@ venv/
 *.db
 *.csv
 *.json
+!keywords.json
